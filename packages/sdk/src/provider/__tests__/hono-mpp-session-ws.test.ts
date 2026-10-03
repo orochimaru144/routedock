@@ -73,7 +73,7 @@ mock.module('mppx/server', {
       create: () => ({
         // Fake channel verification: no Payment credential → 402 challenge,
         // valid Payment credential → verified.
-        channel: (_opts: { amount: string }) => async (request: Request) => {
+        stellar: { channel: (_opts: { amount: string }) => async (request: Request) => {
           const auth = request.headers.get('authorization')
           if (!auth?.startsWith('Payment ')) {
             return {
@@ -88,7 +88,7 @@ mock.module('mppx/server', {
             }
           }
           return { status: 200 }
-        },
+        } },
       }),
     },
   },

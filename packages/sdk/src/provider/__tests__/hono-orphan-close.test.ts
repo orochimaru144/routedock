@@ -67,7 +67,7 @@ mock.module('mppx/server', {
     tempo: {},
     Mppx: {
       create: () => ({
-        channel: () => async (request: Request) => {
+        stellar: { channel: () => async (request: Request) => {
           if (!request.headers.has('authorization')) {
             return {
               status: 402,
@@ -75,7 +75,7 @@ mock.module('mppx/server', {
             }
           }
           return { status: 200 }
-        },
+        } },
       }),
     },
   },

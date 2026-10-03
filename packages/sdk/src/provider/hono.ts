@@ -691,11 +691,12 @@ function createMppSessionHonoHandler(
       if (c.req.method === 'DELETE') {
         const verified = await (
           state.mppx as unknown as {
-            channel: (o: { amount: string; description?: string }) => (
+            stellar: { channel: (o: { amount: string; description?: string }) => (
               r: globalThis.Request,
             ) => Promise<{ status: number; challenge?: globalThis.Response }>
+            }
           }
-        ).channel({ amount: sessionPricing.rate, description: opts.manifest.name })(c.req.raw.clone())
+        ).stellar.channel({ amount: sessionPricing.rate, description: opts.manifest.name })(c.req.raw.clone())
         if (verified.status === 402) {
           const challenge = verified.challenge!
           const headers: Record<string, string> = {}
@@ -713,15 +714,16 @@ function createMppSessionHonoHandler(
 
       const result = await (
         state.mppx as unknown as {
-          channel: (o: { amount: string; description?: string }) => (
+          stellar: { channel: (o: { amount: string; description?: string }) => (
             r: globalThis.Request,
           ) => Promise<{
             status: number
             challenge?: globalThis.Response
             withReceipt?: (r: globalThis.Response) => globalThis.Response
           }>
+          }
         }
-      ).channel({
+      ).stellar.channel({
         amount: sessionPricing.rate,
         description: opts.manifest.name,
       })(c.req.raw)
