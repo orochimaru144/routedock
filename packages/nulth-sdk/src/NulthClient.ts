@@ -4,7 +4,7 @@ import {
   dayBucket,
   encodeAuthSignature,
   hashPayee,
-  mockGroth16Proof,
+  insecureMockProof,
   type ProverBackend,
   DEFAULT_PROVER,
 } from './proof.js'
@@ -23,6 +23,17 @@ export class NulthClient {
   constructor(private readonly config: NulthClientConfig) {
     this.policy = { ...config.policy }
     this.prover = config.prover ?? DEFAULT_PROVER
+    if (this.prover !== 'mock') {
+      throw new Error(
+        `NulthClient: unknown prover backend ${String(config.prover)}; only 'mock' is implemented`,
+      )
+    }
+    if (config.network !== 'testnet') {
+      throw new Error(
+        `NulthClient cannot use the insecure mock prover on mainnet; a production prover is required (network must be 'testnet', got ${String(config.network)})`,
+      )
+    }
+    console.warn('NulthClient is using the insecure mock prover; proofs are not cryptographically sound')
   }
 
   get nulthAccount(): string {
@@ -76,7 +87,7 @@ export class NulthClient {
 
     const proof: NulthProof = {
       version: 1,
-      proof: mockGroth16Proof(preimage),
+      proof: insecureMockProof(preimage),
       publicInputs: {
         authDigest,
         allowlistCommitment: this.policy.allowlistCommitment,
@@ -97,6 +108,13 @@ export class NulthClient {
   }
 
   private enforcePolicy(context: PaymentAuthContext): void {
+    if (context.amountStroops < 0n) {
+      throw new RangeError(`Invalid amountStroops: ${context.amountStroops}`)
+    }
+    if (!Number.isSafeInteger(context.ledgerSequence) || context.ledgerSequence < 0) {
+      throw new RangeError(`Invalid ledgerSequence: ${context.ledgerSequence}`)
+    }
+
     if (
       this.policy.expiryLedger !== undefined &&
       context.ledgerSequence > this.policy.expiryLedger
@@ -120,3 +138,4 @@ export class NulthClient {
     }
   }
 }
+

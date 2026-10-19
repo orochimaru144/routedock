@@ -1,5 +1,4 @@
-import Ajv from 'ajv'
-import addFormats from 'ajv-formats'
+import { Validator, type Schema } from '@cfworker/json-schema'
 import type { RouteDockManifest, PaymentMode } from '../types.js'
 import {
   RouteDockError,
@@ -13,13 +12,13 @@ import {
   wrapFetchError,
 } from '../errors.js'
 import { withRetry, type RetryPolicy } from '../internal/retry.js'
+import { usdcToStroops } from '../internal/usdc.js'
+import { noopLogger, type RouteDockLogger } from '../internal/logger.js'
 import schema from '../schemas/routedock.schema.json' assert { type: 'json' }
 import pkg from '../../package.json' assert { type: 'json' }
 import { verifyManifestSignature } from '../manifest/sign.js'
 
-const ajv = new Ajv()
-addFormats(ajv)
-const validateManifest = ajv.compile(schema)
+const validator = new Validator(schema as unknown as Schema, '7')
 
 const SDK_VERSION = pkg.version as string
 
@@ -61,9 +60,100 @@ function assertManifestActive(manifest: RouteDockManifest, baseUrl: string): voi
   }
 }
 
+/**
+ * Enforce the per-endpoint `deprecated` and `sunset_at` metadata for the URL
+ * being paid. `pay()` never learns the HTTP method, so a path shared by more
+ * than one descriptor (e.g. GET and POST on `/infer`) is refused only when
+ * every matching descriptor has sunset. Paths the manifest does not list keep
+ * today's behavior. Query strings and hashes are ignored because only
+ * `URL.pathname` is compared.
+ */
+export function assertEndpointActive(
+  manifest: RouteDockManifest,
+  url: string,
+  logger?: RouteDockLogger,
+): void {
+  const pathname = new URL(url).pathname
+  const matches = Object.entries(manifest.endpoints).filter(
+    ([, descriptor]) => descriptor.path === pathname,
+  )
+  if (matches.length === 0) return
+
+  const now = Date.now()
+  const allSunset = matches.every(([, descriptor]) => {
+    const sunsetAt = descriptor.sunset_at
+    return typeof sunsetAt === 'string' && Date.parse(sunsetAt) <= now
+  })
+  if (allSunset) {
+    const [key, descriptor] = matches[0]!
+    throw new RouteDockManifestSunsetError(
+      `Endpoint '${key}' (${pathname}) sunset at ${descriptor.sunset_at} and can no longer be used`,
+    )
+  }
+
+  const deprecated = matches.find(([, descriptor]) => descriptor.deprecated === true)
+  if (deprecated && logger) {
+    const [key, descriptor] = deprecated
+    const sunsetSuffix = descriptor.sunset_at ? `; sunset_at ${descriptor.sunset_at}` : ''
+    logger(
+      'warn',
+      `[RouteDock] WARNING: ${manifest.name} → ${pathname}; endpoint '${key}' is deprecated${sunsetSuffix}`,
+    )
+  }
+}
+
+/**
+ * Validate semantic constraints for manifest fields beyond JSON schema syntax.
+ * Enforces:
+ * - All keys in `latency_hints` must be a subset of declared `regions`.
+ * - If `assets` is defined, it must be a non-empty array whose first entry
+ *   (`assets[0]`) matches the root-level `asset` and `asset_contract`.
+ */
+export function assertManifestValid(manifest: RouteDockManifest, baseUrl?: string): void {
+  const context = baseUrl ? ` at ${baseUrl}` : ''
+  if (manifest.latency_hints !== undefined) {
+    if (!Array.isArray(manifest.regions) || manifest.regions.length === 0) {
+      throw new RouteDockManifestError(
+        `Invalid manifest${context}: latency_hints defined without declaring regions`,
+      )
+    }
+    const regionSet = new Set(manifest.regions)
+    for (const region of Object.keys(manifest.latency_hints)) {
+      if (!regionSet.has(region)) {
+        throw new RouteDockManifestError(
+          `Invalid manifest${context}: latency_hints key '${region}' is not declared in regions (${manifest.regions.join(', ')})`,
+        )
+      }
+    }
+  }
+
+  if (manifest.assets !== undefined) {
+    if (!Array.isArray(manifest.assets) || manifest.assets.length === 0) {
+      throw new RouteDockManifestError(
+        `Invalid manifest${context}: assets must be a non-empty array when defined`,
+      )
+    }
+    for (let i = 0; i < manifest.assets.length; i++) {
+      const a = manifest.assets[i]
+      if (!a || typeof a.asset !== 'string' || typeof a.asset_contract !== 'string') {
+        throw new RouteDockManifestError(
+          `Invalid manifest${context}: assets[${i}] must define asset and asset_contract strings`,
+        )
+      }
+    }
+    const first = manifest.assets[0]!
+    if (first.asset !== manifest.asset || first.asset_contract !== manifest.asset_contract) {
+      throw new RouteDockManifestError(
+        `Invalid manifest${context}: assets[0] (${first.asset}:${first.asset_contract}) must match root asset fields (${manifest.asset}:${manifest.asset_contract})`,
+      )
+    }
+  }
+}
+
 interface CacheEntry {
   manifest: RouteDockManifest
   fetchedAt: number
+  expiresAt: number
 }
 
 const CACHE_TTL_MS = 60_000
@@ -107,6 +197,10 @@ class LruCache<K, V> {
       this.map.delete(oldestKey)
     }
   }
+
+  delete(key: K): void {
+    this.map.delete(key)
+  }
 }
 
 /** In-memory manifest cache keyed by base URL, bounded to avoid unbounded heap growth. */
@@ -123,12 +217,67 @@ export function configureManifestCache(maxSize: number): void {
   manifestCache.setMaxSize(maxSize)
 }
 
-export type RouteDockLogger = (message: string) => void
+/**
+ * Evict a provider's cached manifest immediately, forcing the next
+ * `fetchManifest(baseUrl)` to re-fetch and re-validate it. Use when a
+ * provider signals that their manifest changed (e.g. after a config update
+ * or a failed payment due to a mode change) so the next request does not
+ * keep routing on a stale cached copy for the remainder of the TTL.
+ *
+ * The cache is keyed by base URL as passed to `fetchManifest` — callers that
+ * pass a full URL (e.g. `RouteDockClient.invalidateManifest`) must normalize
+ * to the origin before calling this.
+ */
+export function invalidateManifest(baseUrl: string): void {
+  manifestCache.delete(baseUrl)
+}
+
+/**
+ * Per-entry freshness from response headers, per RFC 9111:
+ * `Cache-Control: no-store` and `no-cache` disable caching outright and take
+ * precedence over everything else — the client has no revalidation path, so
+ * `no-cache` (which permits reuse only after revalidation) is treated the
+ * same as `no-store`. Otherwise, `max-age` wins over `Expires`, and both win
+ * over the default TTL. Missing or unparseable directives fall back to the
+ * default TTL (60s). `max-age=0` yields an immediately-stale entry, disabling
+ * caching for that response.
+ */
+function ttlFromHeaders(headers: Headers, now: number): number {
+  const cacheControl = headers.get('cache-control')
+  if (cacheControl) {
+    const directives = cacheControl.split(',').map((directive) => directive.trim().toLowerCase())
+    if (directives.includes('no-store') || directives.includes('no-cache')) {
+      return 0
+    }
+    const maxAge = /max-age=(\d+)/i.exec(cacheControl)
+    if (maxAge) {
+      return Number.parseInt(maxAge[1]!, 10) * 1000
+    }
+  }
+  const expires = headers.get('expires')
+  if (expires) {
+    const expiresTime = Date.parse(expires)
+    if (Number.isFinite(expiresTime)) {
+      return expiresTime - now
+    }
+  }
+  return CACHE_TTL_MS
+}
+
+export type { RouteDockLogger, RouteDockLogLevel, RouteDockLogFields } from '../internal/logger.js'
 
 export interface ModeSelectOptions {
   /** Force mpp-session if the provider supports it */
   sustained?: boolean
   session?: boolean
+  /**
+   * Preferred streaming transport for sustained sessions. When 'websocket',
+   * the mpp-session-ws variant is preferred when the provider advertises it;
+   * when 'sse' (or omitted), the classic mpp-session mode is preferred.
+   * Either transport falls back to the other session variant when the
+   * preferred one is not advertised.
+   */
+  transport?: 'sse' | 'websocket'
   /** Prefer the lowest-cost supported per-request mode when set to 'cost'. */
   optimize?: 'cost'
   /** Optional maximum acceptable per-request amount for cost-based selection. */
@@ -159,12 +308,13 @@ export async function fetchManifest(
   expectedPayee?: string,
 ): Promise<RouteDockManifest> {
   const cached = manifestCache.get(baseUrl)
-  if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
+  if (cached && Date.now() < cached.expiresAt) {
     // Re-assert the trust anchor even on cache hits: the manifest content is
     // immutable, but `expectedPayee` is per-caller, so a caller with a
     // different anchor must still have the binding enforced.
     verifyManifestSignature(cached.manifest, expectedPayee)
     assertClientVersionSupported(cached.manifest, baseUrl)
+    assertManifestValid(cached.manifest, baseUrl)
     assertManifestActive(cached.manifest, baseUrl)
     return cached.manifest
   }
@@ -173,8 +323,10 @@ export async function fetchManifest(
 
   return withRetry(async () => {
     let raw: unknown
+    let resp: Response
+    let expiresAt = 0
     try {
-      const resp = await fetch(url, { signal: AbortSignal.timeout(manifestTimeoutMs) })
+      resp = await fetch(url, { signal: AbortSignal.timeout(manifestTimeoutMs) })
       if (!resp.ok) {
         if (resp.status >= 500 || resp.status === 429 || resp.status === 503) {
           throw httpStatusToError(
@@ -187,7 +339,6 @@ export async function fetchManifest(
           `Manifest fetch failed: HTTP ${resp.status} from ${url}`,
         )
       }
-      raw = await resp.json()
     } catch (err) {
       if (err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
         throw new RouteDockManifestTimeoutError(
@@ -199,16 +350,27 @@ export async function fetchManifest(
       throw wrapFetchError(err, `Manifest fetch error from ${url}`)
     }
 
-    if (!validateManifest(raw)) {
-      const msgs = ajv.errorsText(validateManifest.errors)
+    const now = Date.now()
+    expiresAt = now + ttlFromHeaders(resp.headers, now)
+
+    try {
+      raw = await resp.json()
+    } catch (err) {
+      throw new RouteDockManifestError(`Manifest at ${url} is not valid JSON`, { cause: err })
+    }
+
+    const result = validator.validate(raw)
+    if (!result.valid) {
+      const msgs = result.errors.map(err => err.error).join('; ')
       throw new RouteDockManifestError(`Invalid manifest at ${url}: ${msgs}`)
     }
 
     const manifest = raw as unknown as RouteDockManifest
+    assertManifestValid(manifest, baseUrl)
     verifyManifestSignature(manifest, expectedPayee)
     assertClientVersionSupported(manifest, baseUrl)
     assertManifestActive(manifest, baseUrl)
-    manifestCache.set(baseUrl, { manifest, fetchedAt: Date.now() })
+    manifestCache.set(baseUrl, { manifest, fetchedAt: Date.now(), expiresAt })
     return manifest
   }, retryPolicy)
 }
@@ -223,40 +385,61 @@ function selectFromModes(
   manifest: RouteDockManifest,
   options: ModeSelectOptions,
 ): ModeSelection | undefined {
-  if ((options.sustained || options.session) && modes.includes('mpp-session')) {
-    return { mode: 'mpp-session' }
+  if (options.sustained || options.session) {
+    // Prefer the session variant matching the requested transport, falling
+    // back to the other session variant when the preferred one is missing.
+    if (options.transport === 'websocket') {
+      if (modes.includes('mpp-session-ws')) return { mode: 'mpp-session-ws' }
+      if (modes.includes('mpp-session')) return { mode: 'mpp-session' }
+    } else {
+      if (modes.includes('mpp-session')) return { mode: 'mpp-session' }
+      if (modes.includes('mpp-session-ws')) return { mode: 'mpp-session-ws' }
+    }
   }
 
   if (options.optimize === 'cost') {
+    // A caller-supplied ceiling must be a well-formed USDC decimal string.
+    // Validating up front keeps a malformed value ('abc', '$0.01', '') from
+    // parsing to NaN/Infinity and silently disabling the budget guard, which
+    // would let the cheapest mode be selected at any price.
+    let budgetStroops: bigint | null = null
+    if (options.budget_per_request !== undefined) {
+      try {
+        budgetStroops = usdcToStroops(options.budget_per_request)
+      } catch {
+        throw new RouteDockPolicyRejectError('invalid_budget_per_request')
+      }
+    }
+
     const candidates = (['x402', 'mpp-charge'] as Array<'x402' | 'mpp-charge'>)
       .filter((mode) => modes.includes(mode))
-      .map((mode) => {
-        const pricing = manifest.pricing[mode]
-        const amount = pricing?.amount
-        const parsedAmount = typeof amount === 'string' ? Number.parseFloat(amount) : Number.NaN
-        return {
-          mode: mode as PaymentMode,
-          amount: Number.isFinite(parsedAmount) ? parsedAmount : Number.POSITIVE_INFINITY,
+      .flatMap((mode) => {
+        const amount = manifest.pricing[mode]?.amount
+        if (typeof amount !== 'string') return []
+        try {
+          return [{ mode: mode as PaymentMode, amountStroops: usdcToStroops(amount) }]
+        } catch {
+          // Unparseable pricing can't be compared against a budget — drop it.
+          return []
         }
       })
-      .filter((candidate) => Number.isFinite(candidate.amount))
 
     if (candidates.length > 0) {
-      const budget = options.budget_per_request
-        ? Number.parseFloat(options.budget_per_request)
-        : Number.POSITIVE_INFINITY
-      const affordableCandidates = Number.isFinite(budget)
-        ? candidates.filter((candidate) => candidate.amount <= budget)
-        : candidates
+      const affordableCandidates =
+        budgetStroops === null
+          ? candidates
+          : candidates.filter((candidate) => candidate.amountStroops <= budgetStroops)
 
-      const cheapestCandidate = [...affordableCandidates].sort((a, b) => a.amount - b.amount)[0]
+      const cheapestCandidate = [...affordableCandidates].sort((a, b) =>
+        a.amountStroops < b.amountStroops ? -1 : a.amountStroops > b.amountStroops ? 1 : 0,
+      )[0]
       if (cheapestCandidate) {
         return { mode: cheapestCandidate.mode, reason: 'cost-optimized' }
       }
 
       // All candidates exceed the caller's budget ceiling — error instead of
       // silently falling through to an over-budget mode.
-      if (options.budget_per_request !== undefined) {
+      if (budgetStroops !== null) {
         throw new RouteDockPolicyRejectError('budget_per_request_exceeded')
       }
     }
@@ -276,11 +459,12 @@ function logSelection(
   const reason = selection.reason ? ` (${selection.reason})` : ''
   if (deprecated) {
     log(
+      'warn',
       `[RouteDock] WARNING: ${manifest.name} → ${selection.mode}${reason}; selected deprecated mode because no active supported mode is available`,
     )
     return
   }
-  log(`[RouteDock] ${manifest.name} → ${selection.mode}${reason}`)
+  log('info', `[RouteDock] ${manifest.name} → ${selection.mode}${reason}`)
 }
 
 /**
@@ -296,7 +480,7 @@ export function selectMode(
   options: ModeSelectOptions = {},
 ): PaymentMode {
   const modes = manifest.modes
-  const log = options.logger ?? (() => {})
+  const log = options.logger ?? noopLogger
   const deprecatedSet = new Set(manifest.deprecated_modes ?? [])
 
   if (options.forceMode) {
@@ -307,10 +491,11 @@ export function selectMode(
     }
     if (deprecatedSet.has(options.forceMode)) {
       log(
+        'warn',
         `[RouteDock] WARNING: ${manifest.name} → ${options.forceMode} (forced); selected mode is deprecated`,
       )
     } else {
-      log(`[RouteDock] ${manifest.name} → ${options.forceMode} (forced)`)
+      log('info', `[RouteDock] ${manifest.name} → ${options.forceMode} (forced)`)
     }
     return options.forceMode
   }
@@ -334,3 +519,35 @@ export function selectMode(
     `No supported payment mode found in manifest (modes: ${modes.join(', ')})`,
   )
 }
+
+/**
+ * Rank a list of provider manifests by estimated p50 round-trip latency for a given target region.
+ * Manifests declaring latency_hints for the target region are sorted ascending by latency (lowest first).
+ * Manifests that list the region in `regions` without an explicit latency hint come next.
+ * Manifests not advertising the target region come last.
+ */
+export function rankProvidersByLatency(
+  manifests: RouteDockManifest[],
+  targetRegion: string,
+): RouteDockManifest[] {
+  return [...manifests].sort((a, b) => {
+    const latA = a.latency_hints?.[targetRegion]
+    const latB = b.latency_hints?.[targetRegion]
+    const inRegionsA = a.regions?.includes(targetRegion) ?? false
+    const inRegionsB = b.regions?.includes(targetRegion) ?? false
+
+    // Both have numeric latency hints
+    if (latA !== undefined && latB !== undefined) {
+      return latA - latB
+    }
+    if (latA !== undefined) return -1
+    if (latB !== undefined) return 1
+
+    // Neither has explicit latency hint, check regions inclusion
+    if (inRegionsA && !inRegionsB) return -1
+    if (!inRegionsA && inRegionsB) return 1
+
+    return 0
+  })
+}
+

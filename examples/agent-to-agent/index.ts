@@ -18,9 +18,9 @@
 import { serve } from '@hono/node-server'
 import { Hono } from 'hono'
 import { Keypair } from '@stellar/stellar-sdk'
-import { routedockHono } from '@routedock/sdk/provider/hono'
-import { RouteDockClient } from '@routedock/sdk'
-import type { RouteDockManifest } from '@routedock/sdk'
+import { routedockHono } from '@routedock/routedock/provider/hono'
+import { RouteDockClient } from '@routedock/routedock'
+import type { RouteDockManifest } from '@routedock/routedock'
 
 // ---------------------------------------------------------------------------
 // Config
@@ -31,17 +31,19 @@ const ORCHESTRATOR_SECRET = process.env['ORCHESTRATOR_SECRET'] ?? ''
 const SPECIALIST_SECRET = process.env['SPECIALIST_SECRET'] ?? ''
 const START_SPECIALIST = process.env['START_MOCK_SPECIALIST'] !== 'false'
 const SPECIALIST_PORT = 3200
-const SPECIALIST_URL = `http://localhost:${SPECIALIST_PORT}`
+const SPECIALIST_URL =
+    process.env['SPECIALIST_URL'] ?? `http://localhost:${SPECIALIST_PORT}`
 
 // USDC on Stellar testnet
-let USDC_CONTRACT = process.env['USDC_ASSET_CONTRACT']
+const USDC_CONTRACT: string =
+    process.env['USDC_ASSET_CONTRACT'] ??
+    (STELLAR_NETWORK === 'testnet'
+        ? 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA'
+        : '')
+
 if (!USDC_CONTRACT) {
-    if (STELLAR_NETWORK === 'testnet') {
-        USDC_CONTRACT = 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA'
-    } else {
-        console.error('FATAL: USDC_ASSET_CONTRACT is required for mainnet')
-        process.exit(1)
-    }
+    console.error('FATAL: USDC_ASSET_CONTRACT is required for mainnet')
+    process.exit(1)
 }
 
 // ---------------------------------------------------------------------------
@@ -89,7 +91,7 @@ function buildSpecialistServer(specialistSecret: string): Hono {
     )
 
     app.post('/summarise', async (c) => {
-        const body = await c.req.json<{ text?: string }>().catch(() => ({}))
+        const body = (await c.req.json<{ text?: string }>().catch(() => ({}))) as { text?: string }
         const text = body.text ?? ''
         // Canned summarisation — swap for a real LLM call in production.
         const words = text.trim().split(/\s+/).slice(0, 6).join(' ')
@@ -120,7 +122,9 @@ function requireSecret(name: string, value: string): void {
 
 async function main(): Promise<void> {
     requireSecret('ORCHESTRATOR_SECRET', ORCHESTRATOR_SECRET)
-    requireSecret('SPECIALIST_SECRET', SPECIALIST_SECRET)
+    if (START_SPECIALIST) {
+        requireSecret('SPECIALIST_SECRET', SPECIALIST_SECRET)
+    }
 
     let server: ReturnType<typeof serve> | null = null
 
