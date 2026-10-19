@@ -11,6 +11,9 @@
 
 import { Keypair } from '@stellar/stellar-sdk'
 import type { SupabaseClient } from '@supabase/supabase-js'
+import { usdcToStroops } from '../internal/usdc.js'
+import { channelAuthorizer, formatMppError } from './mppCompatibility.js'
+import { resolveLogger, type RouteDockLogger } from '../internal/logger.js'
 
 type Network = 'testnet' | 'mainnet'
 
@@ -45,12 +48,7 @@ export interface ReconciliationStats {
 }
 
 export function decimalToStroops(amountStr: string): bigint {
-  if (!amountStr.includes('.')) {
-    return BigInt(amountStr)
-  }
-  const [whole, frac] = amountStr.split('.')
-  const paddedFrac = (frac || '').padEnd(7, '0').slice(0, 7)
-  return BigInt((whole || '0') + paddedFrac)
+  return usdcToStroops(amountStr)
 }
 
 /**
@@ -77,7 +75,11 @@ export async function reconcileAbandonedSessions(
       .from('sessions')
       .select('channel_id, channel_contract, cumulative_amount, last_signature, settlement_tx_hash')
       .eq('status', 'closing')
+      .eq('network', opts.network)
+      .eq('payee', payeeKeypair.publicKey())
       .is('settlement_tx_hash', null)
+      .not('last_signature', 'is', null)
+      .order('updated_at', { ascending: true })
       .limit(100)
 
     if (error) {
@@ -119,7 +121,7 @@ export async function reconcileAbandonedSessions(
           channel: channelId,
           amount: closeAmount,
           signature: closeSig,
-          feePayer: { envelopeSigner: payeeKeypair },
+          feePayer: channelAuthorizer(payeeKeypair),
           network: networkId as 'stellar:testnet' | 'stellar:pubnet',
         })
 
@@ -147,7 +149,7 @@ export async function reconcileAbandonedSessions(
         stats.failedCount++
         stats.errors.push({
           channelId: session.channel_id,
-          reason: err instanceof Error ? err.message : String(err),
+          reason: formatMppError(err),
         })
       }
     }
@@ -155,7 +157,7 @@ export async function reconcileAbandonedSessions(
     return stats
   } catch (err) {
     throw new Error(
-      `Session reconciliation failed: ${err instanceof Error ? err.message : String(err)}`,
+      `Session reconciliation failed: ${formatMppError(err)}`,
     )
   }
 }
@@ -166,33 +168,34 @@ export async function reconcileAbandonedSessions(
  */
 export async function runStartupReconciliation(
   opts: SessionReconcilerOptions,
-  logger?: (msg: string) => void,
+  logger?: RouteDockLogger,
 ): Promise<void> {
-  const log = logger || console.log
+  const log = resolveLogger(logger)
 
-  log('[SessionReconciler] Running startup reconciliation...')
+  log('info', '[SessionReconciler] Running startup reconciliation...')
 
   try {
     const stats = await reconcileAbandonedSessions(opts)
 
     if (stats.orphanedCount === 0) {
-      log('[SessionReconciler] No orphaned sessions found')
+      log('info', '[SessionReconciler] No orphaned sessions found')
       return
     }
 
     log(
+      'info',
       `[SessionReconciler] Found ${stats.orphanedCount} orphaned session(s). ` +
       `Recovered: ${stats.recoveredCount}, Skipped: ${stats.skippedCount}, Failed: ${stats.failedCount}`,
     )
 
     if (stats.errors.length > 0) {
-      log('[SessionReconciler] Reconciliation errors:')
+      log('warn', '[SessionReconciler] Reconciliation errors:')
       for (const err of stats.errors) {
-        log(`  - ${err.channelId}: ${err.reason}`)
+        log('warn', `  - ${err.channelId}: ${err.reason}`)
       }
     }
   } catch (err) {
-    log(`[SessionReconciler] Startup reconciliation failed: ${err instanceof Error ? err.message : String(err)}`)
+    log('error', `[SessionReconciler] Startup reconciliation failed: ${formatMppError(err)}`)
     // Non-fatal: allow server to start even if reconciliation fails
   }
 }

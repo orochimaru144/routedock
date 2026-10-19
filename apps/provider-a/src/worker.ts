@@ -1,6 +1,13 @@
 import { Hono } from 'hono'
 import { createClient, type SupabaseClient } from '@supabase/supabase-js'
-import { routedockHono } from '@routedock/routedock/provider/hono'
+import {
+  routedockHono,
+  registerProvider,
+  signManifest,
+  SupabaseSeenTxStore,
+  InMemorySeenTxStore,
+  type SeenTxStore,
+} from '@routedock/routedock/provider/hono'
 import {
   buildManifest,
   HORIZON_URLS,
@@ -10,11 +17,6 @@ import {
   X402_PRICE,
   type Network,
 } from './manifest.js'
-import {
-  InMemorySeenTxStore,
-  SupabaseSeenTxStore,
-  type SeenTxStore,
-} from './SupabaseSeenTxStore.js'
 
 export interface Env {
   STELLAR_NETWORK?: string
@@ -49,6 +51,26 @@ function resolveAssetContract(env: Env, network: Network): string {
 }
 
 /**
+ * Return the names of environment variables that are unset or malformed.
+ * Values are never included — only names, so this is safe to log or return
+ * to a caller directly. Shared by createApp (throws, caught by fetch() below)
+ * and healthResponse (reports 503 without ever building the app).
+ */
+function findStartupProblems(env: Env, network: Network): string[] {
+  const problems: string[] = []
+  if (!env.STELLAR_PAYEE_SECRET || !env.STELLAR_PAYEE_SECRET.startsWith('S')) {
+    problems.push('STELLAR_PAYEE_SECRET')
+  }
+  if (!env.STELLAR_PAYEE_ADDRESS) {
+    problems.push('STELLAR_PAYEE_ADDRESS')
+  }
+  if (network === 'mainnet' && !env.USDC_ASSET_CONTRACT) {
+    problems.push('USDC_ASSET_CONTRACT')
+  }
+  return problems
+}
+
+/**
  * Fetch the XLM/USDC orderbook straight from Horizon's REST API.
  *
  * The Express build used `Horizon.Server(...).orderbook(...)`, which pulls the
@@ -75,17 +97,15 @@ async function fetchOrderBook(network: Network, limit: number): Promise<OrderBoo
   return (await response.json()) as OrderBookResponse
 }
 
-function createApp(env: Env): Hono {
+function createApp(env: Env, ctx: ExecutionContext): Hono {
   const network = resolveNetwork(env.STELLAR_NETWORK)
+
+  const problems = findStartupProblems(env, network)
+  if (problems.length > 0) {
+    throw new Error(`Provider misconfigured: ${problems.join(', ')} unset`)
+  }
+
   const assetContract = resolveAssetContract(env, network)
-
-  if (!env.STELLAR_PAYEE_SECRET || !env.STELLAR_PAYEE_SECRET.startsWith('S')) {
-    throw new Error('STELLAR_PAYEE_SECRET is required and must be a valid Stellar secret key (S...)')
-  }
-  if (!env.STELLAR_PAYEE_ADDRESS) {
-    throw new Error('STELLAR_PAYEE_ADDRESS is required')
-  }
-
   const manifest = buildManifest({ network, payee: env.STELLAR_PAYEE_ADDRESS, assetContract })
 
   const supabase: SupabaseClient | null =
@@ -96,6 +116,16 @@ function createApp(env: Env): Hono {
   const seenTxStore: SeenTxStore = supabase
     ? new SupabaseSeenTxStore(supabase)
     : new InMemorySeenTxStore()
+
+  if (supabase) {
+    const baseUrl = env.PUBLIC_BASE_URL ?? 'https://api-a.routedock.xyz'
+    const signed = signManifest(manifest, env.STELLAR_PAYEE_SECRET)
+    ctx.waitUntil(
+      registerProvider({ supabase, manifest: signed, baseUrl, verified: true }).catch((err) => {
+        console.error('[registry] Failed to register provider-a:', err)
+      }),
+    )
+  }
 
   const providerUrl = `${env.PUBLIC_BASE_URL ?? 'https://api-a.routedock.xyz'}/price`
 
@@ -175,12 +205,18 @@ function createApp(env: Env): Hono {
 
 function healthResponse(env: Env): Response {
   const addr = env.STELLAR_PAYEE_ADDRESS
-  return Response.json({
-    status: 'ok',
-    network: resolveNetwork(env.STELLAR_NETWORK),
-    payee: addr ? `${addr.slice(0, 6)}...${addr.slice(-4)}` : 'not configured',
-    registry: env.SUPABASE_URL && env.SUPABASE_SERVICE_KEY ? 'connected' : 'not configured',
-  })
+  const network = resolveNetwork(env.STELLAR_NETWORK)
+  const missing = findStartupProblems(env, network)
+  return Response.json(
+    {
+      status: missing.length > 0 ? 'misconfigured' : 'ok',
+      network,
+      payee: addr ? `${addr.slice(0, 6)}...${addr.slice(-4)}` : 'not configured',
+      registry: env.SUPABASE_URL && env.SUPABASE_SERVICE_KEY ? 'connected' : 'not configured',
+      ...(missing.length > 0 ? { missing } : {}),
+    },
+    { status: missing.length > 0 ? 503 : 200 },
+  )
 }
 
 /**
@@ -195,7 +231,7 @@ export default {
     if (new URL(request.url).pathname === '/health') return healthResponse(env)
 
     try {
-      cachedApp ??= createApp(env)
+      cachedApp ??= createApp(env, ctx)
     } catch (err) {
       console.error('[startup]', err)
       return Response.json({ error: 'Provider misconfigured' }, { status: 500 })

@@ -13,6 +13,7 @@
 
 import type { RouteDockClient, SessionHandle, PaymentMode } from '@routedock/routedock'
 import { Keypair, Horizon } from '@stellar/stellar-sdk'
+import { MAX_STREAM_MESSAGES } from './tools.js'
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -26,6 +27,31 @@ export type ToolResult = {
   isError?: true
 }
 
+/** Database row representation for a provider in Supabase registry. */
+export interface ProviderRow {
+  name: string
+  description: string
+  network: string
+  asset: string
+  modes: string[]
+  tags: string[]
+  base_url: string
+  [key: string]: unknown
+}
+
+export interface SupabaseQueryResult {
+  data: ProviderRow[] | null
+  error: { message: string } | null
+}
+
+/** Chainable query builder type for Supabase provider queries. */
+export interface SupabaseQueryBuilder {
+  eq?: (field: string, value: unknown) => SupabaseQueryBuilder
+  overlaps?: (field: string, values: string[]) => SupabaseQueryBuilder | Promise<SupabaseQueryResult>
+  then?: (onfulfilled: (res: SupabaseQueryResult) => unknown) => unknown
+  [key: string]: unknown
+}
+
 /** All external dependencies required by the handlers.  Inject fakes in tests. */
 export interface HandlerDeps {
   /** Initialised RouteDockClient for paying / opening sessions. */
@@ -35,14 +61,7 @@ export interface HandlerDeps {
   /** Supabase client for list_providers, or null when not configured. */
   supabase: {
     from: (table: string) => {
-      select: (cols: string) => {
-        eq: (field: string, value: unknown) => {
-          overlaps?: (field: string, values: string[]) => Promise<{ data: unknown[] | null; error: { message: string } | null }>
-          [key: string]: unknown
-        }
-        overlaps?: (field: string, values: string[]) => Promise<{ data: unknown[] | null; error: { message: string } | null }>
-        [key: string]: unknown
-      }
+      select: (cols: string) => SupabaseQueryBuilder
     }
   } | null
   /** Raw Stellar secret key — used by check_balance to derive the public key. */
@@ -87,7 +106,7 @@ function err(message: string): ToolResult {
 export interface PayForDataArgs {
   url: string
   max_amount: string
-  preferred_mode?: 'x402' | 'mpp-charge' | 'mpp-session'
+  preferred_mode?: PaymentMode
 }
 
 /**
@@ -166,7 +185,9 @@ export async function handleOpenSession(
       pricing?: Record<string, { min_deposit?: string }>
     }
 
-    const minDeposit = manifest?.pricing?.['mpp-session']?.min_deposit
+    const minDeposit =
+      manifest?.pricing?.['mpp-session']?.min_deposit ??
+      manifest?.pricing?.['mpp-session-ws']?.min_deposit
     if (minDeposit && parseFloat(initial_deposit) < parseFloat(minDeposit)) {
       return err(
         `initial_deposit ${initial_deposit} is below this provider's min_deposit ${minDeposit}. ` +
@@ -199,6 +220,11 @@ export interface StreamSessionArgs {
 
 /**
  * Pull up to max_messages items from the async iterator exposed by an open session.
+ *
+ * A voucher failure mid-batch (cap reached, provider 4xx/5xx) must not discard
+ * messages that were already paid for: the handler catches the rejection and
+ * returns the partial batch together with the session stats instead of letting
+ * the dispatcher replace the whole result with a bare error.
  */
 export async function handleStreamSession(
   args: StreamSessionArgs,
@@ -215,14 +241,51 @@ export async function handleStreamSession(
     )
   }
 
-  const limit = Math.max(1, max_messages ?? 1)
+  if (
+    max_messages !== undefined &&
+    (!Number.isInteger(max_messages) || max_messages < 1 || max_messages > MAX_STREAM_MESSAGES)
+  ) {
+    return err(
+      `max_messages must be an integer between 1 and ${MAX_STREAM_MESSAGES} (received ${max_messages})`,
+    )
+  }
+
+  const limit = max_messages ?? 1
   const messages: unknown[] = []
   const iterator = session.stream()[Symbol.asyncIterator]()
 
-  for (let i = 0; i < limit; i++) {
-    const { value, done } = await iterator.next()
-    if (done) break
-    messages.push(value)
+  try {
+    for (let i = 0; i < limit; i++) {
+      const { value, done } = await iterator.next()
+      if (done) break
+      messages.push(value)
+    }
+  } catch (error) {
+    // Return the already-paid messages rather than losing them. Do not rethrow:
+    // the dispatcher's catch would drop the batch and the spend it represents.
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: false,
+              error: error instanceof Error ? error.message : String(error),
+              channel_id,
+              count: messages.length,
+              messages,
+              stats: session.stats(),
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+      isError: true,
+    }
+  } finally {
+    // Close the generator created for this call so it does not linger.
+    await iterator.return?.()
   }
 
   return ok({
@@ -391,11 +454,9 @@ export async function handleListProviders(
   }
 
   // Build query — start with the full select, apply filters progressively.
-  // We cast through `any` because the Supabase query builder's chainable type
-  // system doesn't model arbitrary .eq/.overlaps chains at compile time.
-  let query: any = supabase.from('providers').select('*')
+  let query: SupabaseQueryBuilder = supabase.from('providers').select('*')
 
-  if (network) {
+  if (network && query.eq) {
     query = query.eq('network', network)
   }
 
@@ -404,22 +465,24 @@ export async function handleListProviders(
       .split(',')
       .map((t) => t.trim())
       .filter(Boolean)
-    if (tagList.length > 0) {
+    if (tagList.length > 0 && query.overlaps) {
       // tags column is TEXT[] — array overlap, not textSearch
-      query = query.overlaps('tags', tagList)
+      query = query.overlaps('tags', tagList) as unknown as SupabaseQueryBuilder
     }
   }
 
-  const { data, error } = await query
+  const { data, error } = await (query as unknown as PromiseLike<SupabaseQueryResult>)
 
   if (error) {
     return err(`Failed to fetch providers: ${error.message}`)
   }
 
+  const rows = data ?? []
+
   return ok({
     success: true,
-    count: data?.length ?? 0,
-    providers: (data ?? []).map((p: any) => ({
+    count: rows.length,
+    providers: rows.map((p: ProviderRow) => ({
       name: p.name,
       description: p.description,
       network: p.network,
