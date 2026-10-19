@@ -69,7 +69,7 @@ function startManifestServer(
 {
   const logs: string[] = []
   const manifest = createManifest({ deprecated_modes: ['mpp-charge'] })
-  assert.equal(selectMode(manifest, { logger: (message) => logs.push(message) }), 'x402')
+  assert.equal(selectMode(manifest, { logger: (_level, message) => logs.push(message) }), 'x402')
   assert.equal(logs.some((message) => message.includes('WARNING')), false)
 }
 
@@ -77,6 +77,89 @@ function startManifestServer(
 {
   const manifest = createManifest({ deprecated_modes: ['mpp-charge'] })
   assert.equal(selectMode(manifest, { optimize: 'cost' }), 'x402')
+}
+
+// Sustained + websocket transport must prefer mpp-session-ws when advertised.
+{
+  const manifest = createManifest({
+    modes: ['mpp-session', 'mpp-session-ws'],
+    pricing: {
+      'mpp-session': {
+        rate: '0.001',
+        per: 'voucher',
+        channel_factory: 'CTESTCHANNELFACTORY',
+        min_deposit: '0.10',
+        refund_waiting_period_ledgers: 17280,
+      },
+      'mpp-session-ws': {
+        rate: '0.001',
+        per: 'voucher',
+        channel_factory: 'CTESTCHANNELFACTORY',
+        min_deposit: '0.10',
+        refund_waiting_period_ledgers: 17280,
+      },
+    },
+  })
+  assert.equal(selectMode(manifest, { sustained: true, transport: 'websocket' }), 'mpp-session-ws')
+  assert.equal(selectMode(manifest, { sustained: true }), 'mpp-session')
+}
+
+// Sustained + websocket falls back to SSE mpp-session when WS is not advertised.
+{
+  const manifest = createManifest({
+    modes: ['mpp-session'],
+    pricing: {
+      'mpp-session': {
+        rate: '0.001',
+        per: 'voucher',
+        channel_factory: 'CTESTCHANNELFACTORY',
+        min_deposit: '0.10',
+        refund_waiting_period_ledgers: 17280,
+      },
+    },
+  })
+  assert.equal(selectMode(manifest, { sustained: true, transport: 'websocket' }), 'mpp-session')
+}
+
+// Sustained without an explicit transport still uses mpp-session-ws as a
+// fallback when that is the only session variant advertised.
+{
+  const manifest = createManifest({
+    modes: ['mpp-session-ws'],
+    pricing: {
+      'mpp-session-ws': {
+        rate: '0.001',
+        per: 'voucher',
+        channel_factory: 'CTESTCHANNELFACTORY',
+        min_deposit: '0.10',
+        refund_waiting_period_ledgers: 17280,
+      },
+    },
+  })
+  assert.equal(selectMode(manifest, { sustained: true }), 'mpp-session-ws')
+}
+
+// Forcing mpp-session-ws is authoritative when supported, and rejected otherwise.
+{
+  const supported = createManifest({
+    modes: ['mpp-session-ws'],
+    pricing: {
+      'mpp-session-ws': {
+        rate: '0.001',
+        per: 'voucher',
+        channel_factory: 'CTESTCHANNELFACTORY',
+        min_deposit: '0.10',
+        refund_waiting_period_ledgers: 17280,
+      },
+    },
+  })
+  assert.equal(selectMode(supported, { forceMode: 'mpp-session-ws' }), 'mpp-session-ws')
+
+  const unsupported = createManifest()
+  assert.throws(
+    () => selectMode(unsupported, { forceMode: 'mpp-session-ws' }),
+    /does not support forced mode/,
+  )
 }
 
 // Sustained routing must not prefer a deprecated session mode over a live mode.
@@ -106,7 +189,7 @@ function startManifestServer(
 {
   const logs: string[] = []
   const manifest = createManifest({ deprecated_modes: ['x402', 'mpp-charge'] })
-  assert.equal(selectMode(manifest, { logger: (message) => logs.push(message) }), 'mpp-charge')
+  assert.equal(selectMode(manifest, { logger: (_level, message) => logs.push(message) }), 'mpp-charge')
   assert.ok(logs.some((message) => message.includes('WARNING') && message.includes('deprecated')))
 }
 
@@ -117,7 +200,7 @@ function startManifestServer(
   assert.equal(
     selectMode(manifest, {
       forceMode: 'mpp-charge',
-      logger: (message) => logs.push(message),
+      logger: (_level, message) => logs.push(message),
     }),
     'mpp-charge',
   )

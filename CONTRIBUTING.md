@@ -28,7 +28,26 @@ pnpm --filter @routedock/routedock build
 
 ## Verify before you push
 
-Run the same things CI runs, in the same order:
+One command runs the same things CI does, in the same order:
+
+```bash
+pnpm verify          # build + typecheck + tests + provider bundles
+pnpm verify --fast   # build + typecheck only
+```
+
+A **pre-push hook** runs `pnpm verify --fast` automatically. It is installed by
+`pnpm install` (via `prepare`, which sets `core.hooksPath`), so you get it
+without doing anything. Bypass with `git push --no-verify` when you need to.
+
+The hook is not installed when `CI` is set, and it also skips itself when it
+does run on GitHub Actions, since the CI workflow already runs the same checks.
+
+It runs on push rather than on every commit deliberately: the check has to build
+the SDK first, which is slow enough that a per-commit hook gets bypassed, and a
+bypassed hook catches nothing. Pushing is the point where the work becomes
+someone else's problem.
+
+If you would rather run the steps individually:
 
 ```bash
 # 1. Types across every package
@@ -80,6 +99,10 @@ Adding a dependency to a provider is the highest-risk change in this repo. The W
 ```bash
 pnpm --filter provider-a build   # fails loudly if the dep is Workers-hostile
 ```
+
+### Web dashboard
+
+`apps/web` needs `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY`. `cp apps/web/.env.example apps/web/.env.local` — the template ships the public testnet Supabase project, so a plain copy gives a working dashboard. See `apps/web/README.md`.
 
 ## Standards
 

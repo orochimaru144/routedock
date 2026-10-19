@@ -15,16 +15,28 @@ import { stellar as mppChannel, close as channelClose, Store } from '@stellar/mp
 import { Mppx } from 'mppx/server'
 import type { RouteDockManifest, PaymentMode } from '../types.js'
 import { signManifest } from '../manifest/sign.js'
-import { resolvePayee } from './payee.js'
+import { resolvePayee } from '../internal/payee.js'
 import { usdcToUnits } from '../internal/usdc.js'
 import { extractPayerAddress } from './payer.js'
-import type { OrphanedSessionInfo } from './MppSessionHandler.js'
+import { resolveLogger, type RouteDockLogger } from '../internal/logger.js'
+import {
+  channelAuthorizer,
+  onVerifiedCredential,
+  withTypedChannelErrors,
+  type ChannelVerifyCredential,
+} from './mppCompatibility.js'
+import type { Method } from 'mppx'
+import { type ChannelStore, type OrphanedSessionInfo } from './MppSessionHandler.js'
 import { base64ToUtf8, hexToBytes } from './encoding.js'
 import {
   InMemorySeenTxStore,
   paymentIdempotencyKey,
+  checkSettlementReplay,
   type SeenTxStore,
 } from './SeenTxStore.js'
+import { resolveAssetContract } from '../internal/assetUtils.js'
+import { RouteDockManifestError } from '../errors.js'
+import { readSettleResult } from './settleResult.js'
 
 type Network = 'testnet' | 'mainnet'
 
@@ -41,9 +53,11 @@ export interface RouteDockHonoOptions {
     x402?: string
     'mpp-charge'?: string
     'mpp-session'?: { rate: string; channelFactory: string }
+    /** WebSocket transport variant of mpp-session — same channel, WS streaming */
+    'mpp-session-ws'?: { rate: string; channelFactory: string }
   }
-  asset: string
-  assetContract: string
+  asset?: string
+  assetContract?: string
   payee: string
   network: Network
   payeeSecretKey: string
@@ -66,6 +80,14 @@ export interface RouteDockHonoOptions {
    * retries the same payment. Defaults to a per-handler in-memory store.
    */
   seenTxStore?: SeenTxStore
+  /**
+   * Persistent store backing mpp-session channel state and handler state.
+   * Defaults to an in-memory store per handler; supply a durable store (e.g.
+   * Durable Object storage) so voucher tracking survives isolate eviction.
+   */
+  sessionStore?: Store.Store
+  /** Log sink for internal error paths. Defaults to a console-backed logger. */
+  logger?: RouteDockLogger
 }
 
 function createX402HonoHandler(opts: RouteDockHonoOptions): MiddlewareHandler {
@@ -73,7 +95,8 @@ function createX402HonoHandler(opts: RouteDockHonoOptions): MiddlewareHandler {
   const payeeKeypair = Keypair.fromSecret(opts.payeeSecretKey)
   const signer = createEd25519Signer(opts.payeeSecretKey, caip2)
   const x402Price = opts.pricing.x402!
-  const seenTxStore = opts.seenTxStore ?? new InMemorySeenTxStore()
+  const logger = resolveLogger(opts.logger)
+  const seenTxStore = opts.seenTxStore ?? new InMemorySeenTxStore({ logger })
 
   const useOzFacilitator = opts.network === 'mainnet' && opts.facilitatorApiKey
 
@@ -97,24 +120,35 @@ function createX402HonoHandler(opts: RouteDockHonoOptions): MiddlewareHandler {
   }
 
   const amountInBaseUnits = String(usdcToUnits(x402Price))
-  const requirements = {
-    scheme: 'exact' as const,
-    network: caip2,
-    asset: opts.assetContract,
-    amount: amountInBaseUnits,
-    payTo: resolvePayee(opts.manifest, 'x402'),
-    maxTimeoutSeconds: 60,
-    extra: {
-      areFeesSponsored: true,
-      ...(useOzFacilitator ? {} : { facilitatorAddresses: [payeeKeypair.publicKey()] }),
-    },
-  }
 
   return async (c, next) => {
     try {
-      const paymentHeader = c.req.header('payment-signature') ?? c.req.header('x-payment')
+      const endpoint = c.req.path
+      const assetContract = resolveAssetContract(
+        opts.manifest,
+        'x402',
+        endpoint,
+        opts.assetContract,
+      )
+      const requirements = {
+        scheme: 'exact' as const,
+        network: caip2,
+        asset: assetContract,
+        amount: amountInBaseUnits,
+        payTo: resolvePayee(opts.manifest, 'x402'),
+        maxTimeoutSeconds: 60,
+        extra: {
+          areFeesSponsored: true,
+          ...(useOzFacilitator ? {} : { facilitatorAddresses: [payeeKeypair.publicKey()] }),
+        },
+      }
 
-      if (!paymentHeader) {
+      // Shared unpaid/failed-settlement response: it always carries the same
+      // payment requirements header an unpaid request would, so the agent can
+      // retry, and never an X-Payment-Response header. It is defined here
+      // because the requirements depend on the asset contract resolved for this
+      // request's endpoint.
+      const respondPaymentRequired = async (error: string, reason?: string) => {
         if (ozServer) {
           const resourceInfo = {
             url: c.req.url,
@@ -125,7 +159,6 @@ function createX402HonoHandler(opts: RouteDockHonoOptions): MiddlewareHandler {
             resourceInfo,
           )
           c.header('X-Payment-Requirements', encodePaymentRequiredHeader(paymentRequired))
-          return c.json({ error: 'Payment Required' }, 402)
         } else {
           const x402Response = {
             x402Version: 2,
@@ -133,18 +166,37 @@ function createX402HonoHandler(opts: RouteDockHonoOptions): MiddlewareHandler {
             accepts: [requirements],
           }
           c.header('X-Payment-Requirements', encodePaymentRequiredHeader(x402Response))
-          return c.json({ error: 'Payment Required' }, 402)
         }
+        return c.json({ error, ...(reason ? { reason } : {}) }, 402)
+      }
+
+      const paymentHeader = c.req.header('payment-signature') ?? c.req.header('x-payment')
+
+      if (!paymentHeader) {
+        return respondPaymentRequired('Payment Required')
       }
 
       // Idempotency: a retry of an already-settled payment replays the cached
       // settlement response instead of settling (and billing) a second time.
-      const idempotencyKey = await paymentIdempotencyKey((name) => c.req.header(name))
+      // The key is scoped to this route so a payment settled elsewhere can
+      // never replay here, and replays are capped + time-bounded.
+      const idempotencyKey = await paymentIdempotencyKey(
+        (name) => c.req.header(name),
+        {
+          method: c.req.method,
+          path: c.req.path,
+          amount: requirements.amount,
+          payTo: requirements.payTo,
+        },
+      )
       if (idempotencyKey) {
-        const cached = await seenTxStore.get(idempotencyKey)
-        if (cached) {
-          if (cached.headers) {
-            for (const [k, val] of Object.entries(cached.headers)) {
+        const replayCheck = await checkSettlementReplay(seenTxStore, idempotencyKey)
+        if (replayCheck.kind === 'spent') {
+          return c.json({ error: 'Payment already used' }, 402)
+        }
+        if (replayCheck.kind === 'replay') {
+          if (replayCheck.record.headers) {
+            for (const [k, val] of Object.entries(replayCheck.record.headers)) {
               c.header(k, val)
             }
           }
@@ -172,13 +224,15 @@ function createX402HonoHandler(opts: RouteDockHonoOptions): MiddlewareHandler {
 
       if (ozServer) {
         const settleResult = await ozServer.settlePayment(payload, requirements)
-        txHash = (settleResult as { transaction?: string }).transaction ?? null
-        if (settleResult) {
-          paymentResponseHeader = encodePaymentResponseHeader(
-            settleResult as Parameters<typeof encodePaymentResponseHeader>[0],
-          )
-          c.header('X-Payment-Response', paymentResponseHeader)
+        const outcome = readSettleResult(settleResult)
+        if (!outcome.ok) {
+          return respondPaymentRequired('Payment settlement failed', outcome.reason)
         }
+        txHash = outcome.txHash
+        paymentResponseHeader = encodePaymentResponseHeader(
+          settleResult as Parameters<typeof encodePaymentResponseHeader>[0],
+        )
+        c.header('X-Payment-Response', paymentResponseHeader)
       } else {
         const verifyResult = await localFacilitator.verify(
           payload as Parameters<typeof localFacilitator.verify>[0],
@@ -197,32 +251,37 @@ function createX402HonoHandler(opts: RouteDockHonoOptions): MiddlewareHandler {
           payload as Parameters<typeof localFacilitator.settle>[0],
           requirements,
         )
-        txHash = (settleResult as { transaction?: string }).transaction ?? null
-        if (settleResult) {
-          paymentResponseHeader = encodePaymentResponseHeader(
-            settleResult as Parameters<typeof encodePaymentResponseHeader>[0],
-          )
-          c.header('X-Payment-Response', paymentResponseHeader)
+        const outcome = readSettleResult(settleResult)
+        if (!outcome.ok) {
+          return respondPaymentRequired('Payment settlement failed', outcome.reason)
         }
+        txHash = outcome.txHash
+        paymentResponseHeader = encodePaymentResponseHeader(
+          settleResult as Parameters<typeof encodePaymentResponseHeader>[0],
+        )
+        c.header('X-Payment-Response', paymentResponseHeader)
       }
 
       // Record the settlement so a retry of this exact payment is deduped.
       if (idempotencyKey) {
         const headers: Record<string, string> = {}
         if (paymentResponseHeader) headers['X-Payment-Response'] = paymentResponseHeader
-        await seenTxStore.set(idempotencyKey, { txHash, headers })
+        await seenTxStore.set(idempotencyKey, { txHash, headers, createdAt: Date.now() })
       }
 
       if (txHash && opts.onSettled) {
         Promise.resolve().then(() => opts.onSettled!(txHash!, x402Price, 'x402', payerAddress)).catch(err => {
-          console.error('[x402] onSettled callback error:', err)
+          logger('error', '[x402] onSettled callback error', { error: err })
           opts.onCallbackError?.(err, 'onSettled')
         })
       }
 
       await next()
     } catch (err) {
-      console.error('[x402] Settlement error:', err)
+      if (err instanceof RouteDockManifestError) {
+        throw err
+      }
+      logger('error', '[x402] Settlement error', { error: err })
       return c.json({ error: 'Payment settlement failed' }, 500)
     }
   }
@@ -232,22 +291,39 @@ function createMppChargeHonoHandler(opts: RouteDockHonoOptions): MiddlewareHandl
   const networkId = CAIP2[opts.network] as 'stellar:testnet' | 'stellar:pubnet'
   const chargePrice = opts.pricing['mpp-charge']!
   const recipient = resolvePayee(opts.manifest, 'mpp-charge')
-  const seenTxStore = opts.seenTxStore ?? new InMemorySeenTxStore()
+  const logger = resolveLogger(opts.logger)
+  const seenTxStore = opts.seenTxStore ?? new InMemorySeenTxStore({ logger })
 
-  const mppx = Mppx.create({
-    secretKey: opts.payeeSecretKey,
-    methods: [
-      mppCharge({
-        recipient,
-        currency: opts.assetContract,
-        network: networkId,
-        feePayer: { envelopeSigner: opts.payeeSecretKey },
-      }),
-    ],
-  })
+  const mppxInstances = new Map<string, unknown>()
+  function getMppx(contract: string) {
+    let instance = mppxInstances.get(contract)
+    if (!instance) {
+      instance = Mppx.create({
+        secretKey: opts.payeeSecretKey,
+        methods: [
+          mppCharge({
+            recipient,
+            currency: contract,
+            network: networkId,
+            feePayer: { envelopeSigner: opts.payeeSecretKey },
+          }),
+        ],
+      })
+      mppxInstances.set(contract, instance)
+    }
+    return instance
+  }
 
   return async (c, next) => {
     try {
+      const endpoint = c.req.path
+      const assetContract = resolveAssetContract(
+        opts.manifest,
+        'mpp-charge',
+        endpoint,
+        opts.assetContract,
+      )
+      const mppx = getMppx(assetContract)
       // Extract payer public key from the mppx Payment authorization header.
       let payerAddress: string | null = null
       try {
@@ -273,13 +349,25 @@ function createMppChargeHonoHandler(opts: RouteDockHonoOptions): MiddlewareHandl
       }
 
       // Idempotency: a retry of an already-settled charge replays the cached
-      // receipt headers instead of settling (and billing) a second time.
-       const idempotencyKey = await paymentIdempotencyKey((name) => c.req.header(name))
+      // receipt headers instead of settling (and billing) a second time. The
+      // key is scoped to this route and replays are capped + time-bounded.
+      const idempotencyKey = await paymentIdempotencyKey(
+        (name) => c.req.header(name),
+        {
+          method: c.req.method,
+          path: c.req.path,
+          amount: chargePrice,
+          payTo: recipient,
+        },
+      )
       if (idempotencyKey) {
-        const cached = await seenTxStore.get(idempotencyKey)
-        if (cached) {
-          if (cached.headers) {
-            for (const [k, val] of Object.entries(cached.headers)) {
+        const replayCheck = await checkSettlementReplay(seenTxStore, idempotencyKey)
+        if (replayCheck.kind === 'spent') {
+          return c.json({ error: 'Payment already used' }, 402)
+        }
+        if (replayCheck.kind === 'replay') {
+          if (replayCheck.record.headers) {
+            for (const [k, val] of Object.entries(replayCheck.record.headers)) {
               c.header(k, val)
             }
           }
@@ -305,7 +393,7 @@ function createMppChargeHonoHandler(opts: RouteDockHonoOptions): MiddlewareHandl
 
       const result = await handler({
         amount: chargePrice,
-        currency: opts.assetContract,
+        currency: assetContract,
         recipient,
         description: opts.manifest.name,
       })(c.req.raw)
@@ -340,12 +428,13 @@ function createMppChargeHonoHandler(opts: RouteDockHonoOptions): MiddlewareHandl
         await seenTxStore.set(idempotencyKey, {
           txHash: reference ?? null,
           headers: receiptHeaders,
+          createdAt: Date.now(),
         })
       }
 
       if (reference && opts.onSettled) {
         Promise.resolve().then(() => opts.onSettled!(reference!, chargePrice, 'mpp-charge', payerAddress)).catch(err => {
-          console.error('[mpp-charge] onSettled callback error:', err)
+          logger('error', '[mpp-charge] onSettled callback error', { error: err })
           opts.onCallbackError?.(err, 'onSettled')
         })
       }
@@ -357,18 +446,71 @@ function createMppChargeHonoHandler(opts: RouteDockHonoOptions): MiddlewareHandl
   }
 }
 
-function createMppSessionHonoHandler(opts: RouteDockHonoOptions): MiddlewareHandler {
-  const networkId = CAIP2[opts.network] as 'stellar:testnet' | 'stellar:pubnet'
-  const sessionPricing = opts.pricing['mpp-session']!
-  const payeeKeypair = Keypair.fromSecret(opts.payeeSecretKey)
-  const cumulativeKey = `stellar:channel:cumulative:${sessionPricing.channelFactory}`
+/**
+ * Context key set by the mpp-session-ws middleware after a request's payment
+ * credential has been verified, so the app's WebSocket upgrade route can
+ * refuse to upgrade unauthenticated handshakes.
+ */
+export const MPP_SESSION_WS_VERIFIED = 'routedock.mppSessionWs.verified'
 
-  const innerStore = Store.memory()
-  let lastCumulativeAmount = 0n
+/**
+ * True when the routedockHono mpp-session-ws middleware verified the
+ * handshake request's Payment credential (see {@link MPP_SESSION_WS_VERIFIED}).
+ * WebSocket upgrade routes should refuse to upgrade when this is false.
+ */
+export function mppSessionWsVerified(c: { get: (key: string) => unknown }): boolean {
+  return c.get(MPP_SESSION_WS_VERIFIED) === true
+}
+
+/** Contexts the shared session state is invoked with (subset of hono's Context). */
+interface DeleteContext {
+  req: { json(): Promise<unknown> }
+  json: (data: unknown) => Response
+}
+interface SignalContext {
+  req: { raw: { signal?: AbortSignal } }
+}
+
+/**
+ * Mutable per-channel session state shared by the mpp-session and
+ * mpp-session-ws handlers. Extracted so a provider advertising both transports
+ * (same channel factory) verifies vouchers against ONE store and closes the
+ * channel with the combined cumulative — two independent stores would let a
+ * DELETE close see only the vouchers of whichever handler received it.
+ */
+interface MppSessionHandlerState {
+  /** mppx server instance (channel method) used for voucher verification. */
+  mppx: unknown
+  /** Handle a DELETE channel-close request; returns the HTTP response. */
+  handleDelete(c: DeleteContext): Promise<Response>
+  /** Arm the connection-closed orphan guard (idempotent). */
+  armAbortGuard(c: SignalContext): void
+}
+
+/** The last verified voucher: amount, its signature, and the payer it named. */
+interface VerifiedVoucherRecord {
+  amount: bigint
+  signature: string
+  payer: string | null
+}
+
+function createMppSessionHandlerState(
+  opts: RouteDockHonoOptions,
+  sessionPricing: { rate: string; channelFactory: string },
+  reportMode: 'mpp-session' | 'mpp-session-ws',
+): MppSessionHandlerState {
+  const networkId = CAIP2[opts.network] as 'stellar:testnet' | 'stellar:pubnet'
+  const payeeKeypair = Keypair.fromSecret(opts.payeeSecretKey)
+  const logger = resolveLogger(opts.logger)
+  const voucherRecordKey = `routedock:session:voucher:${sessionPricing.channelFactory}`
+
+  const innerStore = opts.sessionStore ?? Store.memory()
+  // The last voucher mppx actually verified — amount, its signature, and the
+  // payer it named. Only `commit` (called after a successful verify) may set
+  // this; nothing derived from an unverified header may reach it.
+  let record: VerifiedVoucherRecord | null = null
   let voucherCount = 0
   let sessionOpened = false
-  let lastSignatureHex = ''
-  let sessionPayerAddress: string | null = null
   let idleTimer: ReturnType<typeof setTimeout> | null = null
   let settledCleanly = false
   let abortListenerArmed = false
@@ -392,177 +534,235 @@ function createMppSessionHonoHandler(opts: RouteDockHonoOptions): MiddlewareHand
     if (typeof maybeUnref.unref === 'function') maybeUnref.unref()
   }
 
+  // `record` lives only in this instance's memory. A Durable Object (or any
+  // other host that can evict and recreate this closure between requests)
+  // loses it even though `commit` persisted it to `innerStore` — so any path
+  // that reads `record` must first try to reload it from the store. Never
+  // overwrites an in-memory record that is already set.
+  async function loadPersistedRecord(): Promise<VerifiedVoucherRecord | null> {
+    if (record) return record
+    try {
+      const stored = (await innerStore.get(voucherRecordKey)) as
+        | { amount?: string; signature?: string; payer?: string | null }
+        | undefined
+      if (!stored || typeof stored.amount !== 'string' || typeof stored.signature !== 'string') {
+        return null
+      }
+      record = { amount: BigInt(stored.amount), signature: stored.signature, payer: stored.payer ?? null }
+    } catch {
+      // Corrupt or unreadable persisted record — proceed as though there is none.
+      return null
+    }
+    return record
+  }
+
   // Flag an open-but-unsettled session for the reconciler. Idempotent.
   async function flagOrphan(reason: 'connection-closed' | 'idle-timeout'): Promise<void> {
+    await loadPersistedRecord()
     if (!sessionOpened || settledCleanly) return
     sessionOpened = false
     abortListenerArmed = false
     clearIdleTimer()
 
-    const cumulativeAmount = (Number(lastCumulativeAmount) / 1e7).toFixed(7)
+    const cumulativeAmount = record ? (Number(record.amount) / 1e7).toFixed(7) : '0.0000000'
     if (opts.onOrphaned) {
       try {
         await opts.onOrphaned(sessionPricing.channelFactory, {
           cumulativeAmount,
-          lastSignature: lastSignatureHex,
+          lastSignature: record?.signature ?? '',
           voucherCount,
           reason,
         })
       } catch (err) {
-        console.error('[mpp-session] onOrphaned handler failed:', err)
+        logger('error', '[mpp-session] onOrphaned handler failed', { error: err })
       }
     }
   }
 
-  const wrappedStore: any = {
+  const wrappedStore: ChannelStore = {
     async get(key: string) { return innerStore.get(key) },
-    async put(key: string, value: unknown) {
-      await innerStore.put(key, value)
-      if (
-        key === cumulativeKey &&
-        value &&
-        typeof value === 'object' &&
-        'amount' in (value as Record<string, unknown>)
-      ) {
-        lastCumulativeAmount = BigInt((value as { amount: string }).amount)
-        voucherCount++
-        // Voucher activity — this session is alive again.
-        settledCleanly = false
-        armIdleTimer()
-
-        if (!sessionOpened) {
-          sessionOpened = true
-          if (opts.onSessionOpen) {
-            Promise.resolve()
-              .then(() => opts.onSessionOpen!(sessionPricing.channelFactory, sessionPayerAddress))
-              .catch((err) => {
-                console.error('[mpp-session] onSessionOpen callback error:', err)
-                opts.onCallbackError?.(err, 'onSessionOpen')
-              })
-          }
-        }
-
-        if (opts.onVoucher) {
-          const humanAmount = (Number(lastCumulativeAmount) / 1e7).toFixed(7)
-          Promise.resolve().then(() => opts.onVoucher!(sessionPricing.channelFactory, voucherCount, humanAmount, lastSignatureHex)).catch(err => {
-            console.error('[mpp-session] onVoucher callback error:', err)
-            opts.onCallbackError?.(err, 'onVoucher')
-          })
-        }
-      }
-    },
+    async put(key: string, value: unknown) { return innerStore.put(key, value) },
     async delete(key: string) { return innerStore.delete(key) },
-    update(key: any, fn: any) { return (innerStore as any).update(key, fn) },
+    async update(key: string, fn: (prev: unknown) => unknown) {
+      const storeWithUpdate = innerStore as Partial<ChannelStore>
+      if (typeof storeWithUpdate.update === 'function') {
+        return storeWithUpdate.update(key, fn)
+      }
+      throw new Error('Store does not support atomic update operations')
+    },
+  }
+
+  // Called only after mppx has verified a credential — never before. Commits
+  // the verified amount/signature/payer as the new record, then runs the
+  // bookkeeping (voucher count, idle timer, onSessionOpen/onVoucher) that used
+  // to run inside the store's `put`, before the caller knew verification had
+  // actually succeeded.
+  async function commit(credential: ChannelVerifyCredential): Promise<void> {
+    await loadPersistedRecord()
+    const payload = credential.payload
+    if (typeof payload?.amount !== 'string' || typeof payload.signature !== 'string') return
+    let amount: bigint
+    try {
+      amount = BigInt(payload.amount)
+    } catch {
+      return
+    }
+    // A late/duplicate commit can't roll the signature back to an earlier amount.
+    if (record && amount < record.amount) return
+
+    const payer = record?.payer ?? extractPayerAddress(credential.source)
+    record = { amount, signature: payload.signature, payer }
+    await innerStore.put(voucherRecordKey, {
+      amount: record.amount.toString(),
+      signature: record.signature,
+      payer: record.payer,
+    })
+
+    voucherCount++
+    // Voucher activity — this session is alive again.
+    settledCleanly = false
+    armIdleTimer()
+
+    if (!sessionOpened) {
+      sessionOpened = true
+      if (opts.onSessionOpen) {
+        Promise.resolve()
+          .then(() => opts.onSessionOpen!(sessionPricing.channelFactory, record!.payer))
+          .catch((err) => {
+            logger('error', '[mpp-session] onSessionOpen callback error', { error: err })
+            opts.onCallbackError?.(err, 'onSessionOpen')
+          })
+      }
+    }
+
+    if (opts.onVoucher) {
+      const humanAmount = (Number(record.amount) / 1e7).toFixed(7)
+      Promise.resolve().then(() => opts.onVoucher!(sessionPricing.channelFactory, voucherCount, humanAmount, record!.signature)).catch(err => {
+        logger('error', '[mpp-session] onVoucher callback error', { error: err })
+        opts.onCallbackError?.(err, 'onVoucher')
+      })
+    }
   }
 
   const mppx = Mppx.create({
     secretKey: opts.payeeSecretKey,
     methods: [
-      mppChannel({
-        channel: sessionPricing.channelFactory,
-        commitmentKey: opts.commitmentPublicKey!,
-        network: networkId,
-        store: wrappedStore,
-        sourceAccount: payeeKeypair.publicKey(),
-        feePayer: { envelopeSigner: payeeKeypair },
-      }),
+      withTypedChannelErrors(
+        onVerifiedCredential(
+          mppChannel({
+            channel: sessionPricing.channelFactory,
+            commitmentKey: opts.commitmentPublicKey!,
+            network: networkId,
+            store: wrappedStore,
+            sourceAccount: payeeKeypair.publicKey(),
+            feePayer: channelAuthorizer(payeeKeypair),
+          }) as Method.AnyServer,
+          commit,
+        ),
+      ),
     ],
   })
 
+  return {
+    mppx,
+
+    async handleDelete(c: DeleteContext): Promise<Response> {
+      await loadPersistedRecord()
+      let body: { amount?: string; signature?: string } | undefined
+      try {
+        body = await c.req.json() as { amount?: string; signature?: string }
+      } catch {
+        // empty or non-JSON body
+      }
+
+      const bodyAmount = body?.amount ? BigInt(body.amount) : 0n
+      const recordAmount = record?.amount ?? 0n
+      let closeAmount: bigint
+      let closeSig: string
+      if (bodyAmount > recordAmount) {
+        closeAmount = bodyAmount
+        closeSig = body?.signature ?? record?.signature ?? ''
+      } else {
+        closeAmount = recordAmount
+        // Prefer the provider's own verified-voucher signature. Fall back to
+        // the client's only when it signs the same amount and the provider
+        // never verified one — otherwise a close for a genuinely tracked
+        // amount no-ops and the session is never flagged for recovery.
+        closeSig =
+          record?.signature ||
+          (bodyAmount === recordAmount ? body?.signature ?? '' : '')
+      }
+
+      if (closeAmount > 0n && closeSig) {
+        const closeTxHash = await channelClose({
+          channel: sessionPricing.channelFactory,
+          amount: closeAmount,
+          signature: hexToBytes(closeSig),
+          feePayer: channelAuthorizer(payeeKeypair),
+          network: networkId,
+        })
+
+        // Clean close — suppress any orphan flagging for this session. Only
+        // after the close broadcast succeeded: if channelClose throws, the
+        // orphan state must stay armed so the reconciler can still recover
+        // this channel. Matches MppSessionHandler.ts ordering.
+        settledCleanly = true
+        clearIdleTimer()
+
+        const closePayer = record?.payer ?? null
+
+        if (opts.onSettled) {
+          const totalPaid = (Number(closeAmount) / 1e7).toFixed(7)
+          Promise.resolve().then(() => opts.onSettled!(closeTxHash, totalPaid, reportMode, closePayer)).catch(err => {
+            logger('error', '[mpp-session] onSettled callback error', { error: err })
+            opts.onCallbackError?.(err, 'onSettled')
+          })
+        }
+
+        sessionOpened = false
+        voucherCount = 0
+        record = null
+        await innerStore.delete(voucherRecordKey)
+        abortListenerArmed = false
+
+        return c.json({ closeTxHash })
+      }
+
+      return c.json({ closeTxHash: null, message: 'no vouchers received' })
+    },
+
+    armAbortGuard(c: SignalContext): void {
+      // Payment verified. The Workers/edge runtime exposes connection teardown
+      // via the request's AbortSignal — use it (in place of Node's
+      // `req.on('close')`) so a client crash mid-session flags the channel for
+      // the reconciler instead of leaking state.
+      const signal = c.req.raw.signal
+      if (signal && !abortListenerArmed) {
+        abortListenerArmed = true
+        signal.addEventListener(
+          'abort',
+          () => { void flagOrphan('connection-closed') },
+          { once: true },
+        )
+      }
+    },
+  }
+}
+
+function createMppSessionHonoHandler(
+  opts: RouteDockHonoOptions,
+  config: { mode: 'mpp-session' | 'mpp-session-ws' },
+  state: MppSessionHandlerState,
+): MiddlewareHandler {
+  const sessionPricing = opts.pricing[config.mode]!
   return async (c, next) => {
     try {
       if (c.req.method === 'DELETE') {
-        let body: { amount?: string; signature?: string } | undefined
-        try {
-          body = await c.req.json() as { amount?: string; signature?: string }
-        } catch {
-          // empty or non-JSON body
-        }
-
-        const bodyAmount = body?.amount ? BigInt(body.amount) : 0n
-        let closeAmount: bigint
-        let closeSig: string
-        if (bodyAmount > lastCumulativeAmount) {
-          closeAmount = bodyAmount
-          closeSig = body?.signature ?? lastSignatureHex
-        } else {
-          closeAmount = lastCumulativeAmount
-          // Prefer the provider's own tracked signature. Fall back to the
-          // client's only when it signs the same amount and the provider never
-          // captured one (voucher reached the mppx store without a Payment
-          // credential) — otherwise a close for a genuinely tracked amount
-          // no-ops and the session is never flagged for recovery.
-          closeSig =
-            lastSignatureHex ||
-            (bodyAmount === lastCumulativeAmount ? body?.signature ?? '' : '')
-        }
-
-        if (closeAmount > 0n && closeSig) {
-          const closeTxHash = await channelClose({
-            channel: sessionPricing.channelFactory,
-            amount: closeAmount,
-            signature: hexToBytes(closeSig),
-            feePayer: { envelopeSigner: payeeKeypair },
-            network: networkId,
-          })
-
-          // Clean close — suppress any orphan flagging for this session. Only
-          // after the close broadcast succeeded: if channelClose throws, the
-          // orphan state must stay armed so the reconciler can still recover
-          // this channel. Matches MppSessionHandler.ts ordering.
-          settledCleanly = true
-          clearIdleTimer()
-
-          if (opts.onSettled) {
-            const totalPaid = (Number(closeAmount) / 1e7).toFixed(7)
-            Promise.resolve().then(() => opts.onSettled!(closeTxHash, totalPaid, 'mpp-session', sessionPayerAddress)).catch(err => {
-              console.error('[mpp-session] onSettled callback error:', err)
-              opts.onCallbackError?.(err, 'onSettled')
-            })
-          }
-
-          sessionOpened = false
-          voucherCount = 0
-          lastCumulativeAmount = 0n
-          sessionPayerAddress = null
-          abortListenerArmed = false
-
-          return c.json({ closeTxHash })
-        }
-
-        return c.json({ closeTxHash: null, message: 'no vouchers received' })
-      }
-
-      const authHeader = c.req.header('authorization')
-      if (authHeader?.startsWith('Payment ')) {
-        try {
-          const credB64 = authHeader
-            .replace(/^Payment\s+/, '')
-            .split(',')
-            .find((p) => p.trim().startsWith('credential='))
-          if (credB64) {
-            const credJson = base64ToUtf8(
-              credB64.split('=').slice(1).join('=').replace(/^"|"$/g, ''),
-            )
-            const cred = JSON.parse(credJson) as {
-              sender?: string
-              payload?: { signature?: string; sender?: string; from?: string }
-            }
-            if (cred.payload?.signature) {
-              lastSignatureHex = cred.payload.signature
-            }
-            if (!sessionPayerAddress) {
-              const key = cred.sender ?? cred.payload?.sender ?? cred.payload?.from
-              sessionPayerAddress = extractPayerAddress(key)
-            }
-          }
-        } catch {
-          // non-fatal
-        }
+        return state.handleDelete(c as unknown as DeleteContext)
       }
 
       const result = await (
-        mppx as unknown as {
+        state.mppx as unknown as {
           channel: (o: { amount: string; description?: string }) => (
             r: globalThis.Request,
           ) => Promise<{
@@ -583,18 +783,15 @@ function createMppSessionHonoHandler(opts: RouteDockHonoOptions): MiddlewareHand
         return new Response(await challenge.text(), { status: 402, headers })
       }
 
-      // Payment verified. The Workers/edge runtime exposes connection teardown
-      // via the request's AbortSignal — use it (in place of Node's
-      // `req.on('close')`) so a client crash mid-session flags the channel for
-      // the reconciler instead of leaking state.
-      const signal = c.req.raw.signal
-      if (signal && !abortListenerArmed) {
-        abortListenerArmed = true
-        signal.addEventListener(
-          'abort',
-          () => { void flagOrphan('connection-closed') },
-          { once: true },
-        )
+      state.armAbortGuard(c as unknown as SignalContext)
+
+      // mpp-session-ws: the verified request is a WebSocket handshake, so hand
+      // control to the app's upgrade route (it checks MPP_SESSION_WS_VERIFIED)
+      // instead of letting the data route answer with a 200 body.
+      if (config.mode === 'mpp-session-ws' && isWebSocketUpgradeRequest(c)) {
+        c.set(MPP_SESSION_WS_VERIFIED, true)
+        await next()
+        return
       }
 
       await next()
@@ -602,6 +799,13 @@ function createMppSessionHonoHandler(opts: RouteDockHonoOptions): MiddlewareHand
       throw err
     }
   }
+}
+
+/** True when the request is a WebSocket upgrade handshake. */
+function isWebSocketUpgradeRequest(c: {
+  req: { header: (name: string) => string | undefined }
+}): boolean {
+  return (c.req.header('upgrade') ?? '').toLowerCase() === 'websocket'
 }
 
 /**
@@ -639,11 +843,24 @@ export function routedockHono(opts: RouteDockHonoOptions): MiddlewareHandler {
     handlers.push(createMppChargeHonoHandler({ ...opts, manifest: signedManifest }))
   }
 
-  if (opts.modes.includes('mpp-session') && opts.pricing['mpp-session']) {
+  // Session modes (mpp-session, mpp-session-ws) share one channel store so a
+  // provider advertising both transports verifies vouchers against the same
+  // cumulative state and a DELETE close sees the combined total.
+  const sessionModes = (['mpp-session', 'mpp-session-ws'] as const).filter(
+    (mode) => opts.modes.includes(mode) && !!opts.pricing[mode],
+  )
+  const primarySessionMode = sessionModes[0]
+  if (primarySessionMode) {
     if (!opts.commitmentPublicKey) {
-      throw new Error('routedockHono: mpp-session mode requires commitmentPublicKey')
+      throw new Error('routedockHono: mpp-session/mpp-session-ws mode requires commitmentPublicKey')
     }
-    handlers.push(createMppSessionHonoHandler({ ...opts, manifest: signedManifest }))
+    const sessionPricing = opts.pricing[primarySessionMode]!
+    const sharedState = createMppSessionHandlerState(opts, sessionPricing, primarySessionMode)
+    for (const mode of sessionModes) {
+      handlers.push(
+        createMppSessionHonoHandler({ ...opts, manifest: signedManifest }, { mode }, sharedState),
+      )
+    }
   }
 
   return async (c, next) => {
@@ -672,3 +889,20 @@ export function routedockHono(opts: RouteDockHonoOptions): MiddlewareHandler {
     return handler(c, next)
   }
 }
+
+export { registerProvider, type RegisterProviderOptions } from './registerProvider.js'
+export { signManifest } from '../manifest/sign.js'
+export {
+  SupabaseSeenTxStore,
+} from '../store/SupabaseSeenTxStore.js'
+export {
+  InMemorySeenTxStore,
+  type SeenTxStore,
+  type SettlementRecord,
+} from './SeenTxStore.js'
+export {
+  reconcileAbandonedSessions,
+  runStartupReconciliation,
+  type SessionReconcilerOptions,
+  type ReconciliationStats,
+} from './SessionReconciler.js'
